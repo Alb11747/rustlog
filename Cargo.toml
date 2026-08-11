@@ -72,6 +72,9 @@ bitflags = { version = "2.5.0", features = ["serde"] }
 [dev-dependencies]
 pretty_assertions = "1.4.0"
 
+[patch.crates-io]
+twitch-irc = { path = "vendor/twitch-irc" }
+
 [profile.release]
 strip = true
 lto = "thin"

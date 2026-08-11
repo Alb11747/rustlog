@@ -7,6 +7,7 @@ use crate::{
 };
 use anyhow::{anyhow, Context};
 use chrono::Utc;
+use dashmap::{DashMap, DashSet};
 use lazy_static::lazy_static;
 use moka::sync::Cache;
 use prometheus::{register_int_counter_vec, IntCounterVec};
@@ -18,10 +19,10 @@ use std::{
 use tokio::{
     sync::{
         mpsc::{Receiver, Sender},
-        Mutex,
+        Mutex, Notify,
     },
     task::JoinHandle,
-    time::sleep,
+    time::{sleep, sleep_until, Instant},
 };
 use tracing::{debug, error, info, log::warn, trace};
 use twitch_irc::{
@@ -35,7 +36,9 @@ const CHANNELS_REFETCH_RETRY_INTERVAL_SECONDS: u64 = 5;
 const RECENT_MESSAGE_DEDUPE_TTL_SECONDS: u64 = 30;
 const RECENT_MESSAGE_DEDUPE_CAPACITY: u64 = 50_000;
 const RECENT_MESSAGE_INFLIGHT_CAPACITY: u64 = 10_000;
-const RECENT_MESSAGE_INFLIGHT_TTL_SECONDS: u64 = 30;
+const RECENT_MESSAGE_INFLIGHT_TTL_SECONDS: u64 = 180;
+const RECENT_MESSAGE_STARTUP_DELAYS_SECONDS: [u64; 5] = [0, 5, 15, 30, 60];
+const RECENT_MESSAGE_RECONNECT_DELAYS_SECONDS: [u64; 6] = [0, 5, 15, 30, 60, 120];
 
 type TwitchClient<C> = TwitchIRCClient<SecureTCPTransport, C>;
 
@@ -74,7 +77,12 @@ struct Bot {
     recent_messages: RecentMessagesClient,
     recent_message_dedupe: Cache<String, ()>,
     backfill_inflight: Cache<String, ()>,
+    backfill_pending: Arc<DashSet<String>>,
+    backfill_wakeups: Arc<DashMap<String, Arc<Notify>>>,
     backfill_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    seen_channel_joins: Arc<DashSet<String>>,
+    startup_backfill_delays: Arc<[Duration]>,
+    reconnect_backfill_delays: Arc<[Duration]>,
     #[cfg(test)]
     skip_existing_message_lookup: bool,
 }
@@ -106,7 +114,16 @@ impl Bot {
                 .time_to_live(Duration::from_secs(RECENT_MESSAGE_INFLIGHT_TTL_SECONDS))
                 .max_capacity(RECENT_MESSAGE_INFLIGHT_CAPACITY)
                 .build(),
+            backfill_pending: Arc::new(DashSet::new()),
+            backfill_wakeups: Arc::new(DashMap::new()),
             backfill_tasks: Arc::new(Mutex::new(Vec::new())),
+            seen_channel_joins: Arc::new(DashSet::new()),
+            startup_backfill_delays: RECENT_MESSAGE_STARTUP_DELAYS_SECONDS
+                .map(Duration::from_secs)
+                .into(),
+            reconnect_backfill_delays: RECENT_MESSAGE_RECONNECT_DELAYS_SECONDS
+                .map(Duration::from_secs)
+                .into(),
             #[cfg(test)]
             skip_existing_message_lookup: false,
         }
@@ -245,7 +262,13 @@ impl Bot {
     async fn trigger_backfill_for_own_join(&self, msg: &ServerMessage, own_login: &str) {
         if let ServerMessage::Join(join) = msg {
             if join.user_login.eq_ignore_ascii_case(own_login) {
-                self.trigger_recent_messages_fetch(join.channel_login.clone(), "successful join")
+                let channel_login = normalize_channel_login(&join.channel_login);
+                let schedule = if self.seen_channel_joins.insert(channel_login.clone()) {
+                    BackfillSchedule::Startup
+                } else {
+                    BackfillSchedule::Reconnect
+                };
+                self.trigger_recent_messages_fetch(channel_login, "successful join", schedule)
                     .await;
             }
         }
@@ -283,7 +306,8 @@ impl Bot {
                 timestamp,
                 raw: raw_irc,
             };
-            let message = StructuredMessage::from_unstructured(&unstructured)?.into_owned();
+            let mut message = StructuredMessage::from_unstructured(&unstructured)?.into_owned();
+            message.channel_login = normalize_channel_login(&message.channel_login).into();
             let dedupe_key = structured_event_identity(&message);
             return Ok(Some(PreparedMessage {
                 message,
@@ -326,35 +350,136 @@ impl Bot {
         Ok(())
     }
 
-    async fn trigger_recent_messages_fetch(&self, channel_login: String, reason: &'static str) {
+    async fn trigger_recent_messages_fetch(
+        &self,
+        channel_login: String,
+        reason: &'static str,
+        schedule: BackfillSchedule,
+    ) {
         if !self.recent_messages.enabled() {
             return;
         }
 
-        let channel_login = channel_login.to_ascii_lowercase();
+        let channel_login = normalize_channel_login(&channel_login);
+        let wakeup = self
+            .backfill_wakeups
+            .entry(channel_login.clone())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone();
         if !self
             .backfill_inflight
             .entry(channel_login.clone())
             .or_insert_with(|| ())
             .is_fresh()
         {
+            if matches!(schedule, BackfillSchedule::Reconnect) {
+                self.backfill_pending.insert(channel_login.clone());
+                self.backfill_inflight.insert(channel_login, ());
+                wakeup.notify_waiters();
+            }
             return;
         }
 
         let bot = self.clone();
+        let mut delays: Arc<[Duration]> = match schedule {
+            #[cfg(test)]
+            BackfillSchedule::OneShot => [Duration::ZERO].into(),
+            BackfillSchedule::Startup => self.startup_backfill_delays.clone(),
+            BackfillSchedule::Reconnect => self.reconnect_backfill_delays.clone(),
+        };
+        let reconnect_delays = self.reconnect_backfill_delays.clone();
         let handle = tokio::spawn(async move {
-            if let Err(err) = bot.fetch_recent_messages_for_channel(&channel_login).await {
-                warn!("Recent-message backfill failed for {channel_login} after {reason}: {err:#}");
+            'restart_schedule: loop {
+                let started_at = Instant::now();
+                let active_delays = delays.clone();
+                for (attempt, delay) in active_delays.iter().enumerate() {
+                    let deadline = started_at + *delay;
+                    loop {
+                        if bot.backfill_pending.remove(&channel_login).is_some() {
+                            delays = reconnect_delays.clone();
+                            info!(
+                                "Restarting recent-message recovery schedule for {channel_login} after another successful join"
+                            );
+                            continue 'restart_schedule;
+                        }
+                        tokio::select! {
+                            _ = sleep_until(deadline) => break,
+                            _ = wakeup.notified() => continue,
+                        }
+                    }
+
+                    let expected_channel_id = match bot
+                        .resolve_expected_channel_id(&channel_login)
+                        .await
+                    {
+                        Ok(channel_id) => channel_id,
+                        Err(err) => {
+                            warn!(
+                                "Recent-message backfill could not verify {channel_login} after {reason} (attempt {} of {}): {err:#}",
+                                attempt + 1,
+                                active_delays.len()
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(err) = bot
+                        .fetch_recent_messages_for_channel(&channel_login, &expected_channel_id)
+                        .await
+                    {
+                        warn!(
+                            "Recent-message backfill failed for {channel_login} after {reason} (attempt {} of {}): {err:#}",
+                            attempt + 1,
+                            active_delays.len()
+                        );
+                    }
+
+                    if bot.backfill_pending.remove(&channel_login).is_some() {
+                        delays = reconnect_delays.clone();
+                        info!(
+                            "Restarting recent-message recovery schedule for {channel_login} after another successful join"
+                        );
+                        continue 'restart_schedule;
+                    }
+                }
+
+                bot.backfill_inflight.invalidate(&channel_login);
+                if bot.backfill_pending.remove(&channel_login).is_some() {
+                    bot.backfill_inflight.insert(channel_login.clone(), ());
+                    delays = reconnect_delays.clone();
+                    continue;
+                }
+                break;
             }
-            bot.backfill_inflight.invalidate(&channel_login);
         });
         let mut tasks = self.backfill_tasks.lock().await;
         tasks.retain(|task| !task.is_finished());
         tasks.push(handle);
     }
 
-    async fn fetch_recent_messages_for_channel(&self, channel_login: &str) -> anyhow::Result<()> {
-        let response = self.recent_messages.fetch(channel_login).await?;
+    async fn resolve_expected_channel_id(&self, channel_login: &str) -> anyhow::Result<String> {
+        match self.app.users.get_id(channel_login) {
+            Some(Some(channel_id)) => return Ok(channel_id),
+            Some(None) => return Err(anyhow!("Twitch reports the channel is unavailable")),
+            None => {}
+        }
+
+        self.app
+            .get_users(vec![], vec![channel_login.to_owned()], false)
+            .await?
+            .into_iter()
+            .find_map(|(channel_id, login)| {
+                (normalize_channel_login(&login) == channel_login).then_some(channel_id)
+            })
+            .context("Twitch did not return the expected channel ID")
+    }
+
+    async fn fetch_recent_messages_for_channel(
+        &self,
+        channel_login: &str,
+        expected_channel_id: &str,
+    ) -> anyhow::Result<()> {
+        let channel_login = normalize_channel_login(channel_login);
+        let response = self.recent_messages.fetch(&channel_login).await?;
         if response.error.is_some() || response.error_code.is_some() {
             warn!(
                 "Recent-message backfill skipped for {channel_login}: error={:?} error_code={:?}",
@@ -363,38 +488,76 @@ impl Bot {
             return Ok(());
         }
 
+        let response_count = response.messages.len();
         let mut candidates = Vec::new();
-        let mut response_keys = HashSet::new();
         let mut parse_failures = 0_usize;
-        for raw in response.messages {
-            let parsed = IRCMessage::parse(raw.trim().trim_matches('\0'))
-                .map_err(anyhow::Error::from)
-                .and_then(|message| self.prepare_message(message, &raw));
+        let mut missing_timestamps = 0_usize;
+        let mut channel_login_mismatches = 0_usize;
+        let mut channel_id_mismatches = 0_usize;
+        for (response_index, raw) in response.messages.into_iter().enumerate() {
+            let normalized_raw = trim_irc_framing(&raw);
+            let parsed = IRCMessage::parse(normalized_raw).map_err(anyhow::Error::from);
             match parsed {
-                Ok(Some(prepared)) if response_keys.insert(prepared.dedupe_key.clone()) => {
-                    candidates.push(prepared);
+                Ok(message) => {
+                    if extract_raw_timestamp(&message).is_none() {
+                        missing_timestamps += 1;
+                        continue;
+                    }
+                    match self.prepare_message(message, normalized_raw) {
+                        Ok(Some(prepared)) => {
+                            if prepared.message.channel_login != channel_login {
+                                channel_login_mismatches += 1;
+                            } else if prepared.message.channel_id != expected_channel_id {
+                                channel_id_mismatches += 1;
+                            } else {
+                                candidates.push((response_index, prepared));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => parse_failures += 1,
+                    }
                 }
-                Ok(_) => {}
                 Err(_) => parse_failures += 1,
             }
         }
-        if parse_failures > 0 {
-            warn!(
-                "Recent-message backfill for {channel_login} skipped {parse_failures} malformed raw IRC line(s)"
-            );
-        }
+
+        candidates.sort_by_key(|(response_index, prepared)| {
+            (prepared.message.timestamp, *response_index)
+        });
+        let mut response_keys = HashSet::new();
+        let before_response_dedupe = candidates.len();
+        candidates.retain(|(_, prepared)| response_keys.insert(prepared.dedupe_key.clone()));
+        let response_duplicates = before_response_dedupe - candidates.len();
+        let candidates = candidates
+            .into_iter()
+            .map(|(_, prepared)| prepared)
+            .collect::<Vec<_>>();
 
         let existing_keys = self.existing_message_keys(&candidates).await?;
+        let mut existing_duplicates = 0_usize;
+        let mut recent_duplicates = 0_usize;
+        let mut stored = 0_usize;
+        let mut write_failures = 0_usize;
         for prepared in candidates {
-            if existing_keys.contains(&prepared.dedupe_key)
-                || !self.claim_message(&prepared.dedupe_key)
-            {
+            if existing_keys.contains(&prepared.dedupe_key) {
+                existing_duplicates += 1;
+                continue;
+            }
+            if !self.claim_message(&prepared.dedupe_key) {
+                recent_duplicates += 1;
                 continue;
             }
             if let Err(err) = self.write_prepared(prepared).await {
+                write_failures += 1;
                 warn!("Could not store recent-message backfill event for {channel_login}: {err}");
+            } else {
+                stored += 1;
             }
         }
+
+        info!(
+            "Recent-message backfill summary for {channel_login}: received={response_count} stored={stored} response_duplicates={response_duplicates} existing_duplicates={existing_duplicates} recent_duplicates={recent_duplicates} malformed={parse_failures} missing_timestamp={missing_timestamps} channel_login_mismatch={channel_login_mismatches} channel_id_mismatch={channel_id_mismatches} write_failures={write_failures}"
+        );
 
         Ok(())
     }
@@ -430,10 +593,7 @@ impl Bot {
             let buffered = self
                 .app
                 .flush_buffer
-                .messages_by_channel(
-                    from_millis..to_millis.saturating_add(1),
-                    &channel_id,
-                )
+                .messages_by_channel(from_millis..to_millis.saturating_add(1), &channel_id)
                 .await;
             existing_keys.extend(
                 buffered
@@ -562,6 +722,8 @@ impl Bot {
                     ChannelAction::Part => {
                         info!("Parting channel {channel_name}");
                         config_channels.remove(&channel_id);
+                        self.seen_channel_joins
+                            .remove(&normalize_channel_login(&channel_name));
                         client.part(channel_name);
                     }
                 }
@@ -579,6 +741,25 @@ enum ChannelAction {
     Part,
 }
 
+#[derive(Clone, Copy)]
+enum BackfillSchedule {
+    #[cfg(test)]
+    OneShot,
+    Startup,
+    Reconnect,
+}
+
+fn normalize_channel_login(channel_login: &str) -> String {
+    channel_login
+        .trim_matches(|character: char| character.is_ascii_whitespace() || character == '\0')
+        .trim_start_matches('#')
+        .to_ascii_lowercase()
+}
+
+fn trim_irc_framing(raw: &str) -> &str {
+    raw.trim_matches(|character: char| character.is_ascii_whitespace() || character == '\0')
+}
+
 fn structured_event_identity(message: &StructuredMessage<'_>) -> String {
     if let Some(message_id) = message.uuid() {
         format!("uuid:{message_id}")
@@ -592,7 +773,8 @@ fn structured_event_identity(message: &StructuredMessage<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        structured_event_identity, Bot, ServerMessage, RECENT_MESSAGE_INFLIGHT_TTL_SECONDS,
+        normalize_channel_login, structured_event_identity, trim_irc_framing, BackfillSchedule,
+        Bot, ServerMessage, RECENT_MESSAGE_INFLIGHT_TTL_SECONDS,
     };
     use crate::{
         app::{cache::UsersCache, App},
@@ -636,6 +818,8 @@ mod tests {
         .unwrap();
         let optout_codes = Arc::new(DashSet::new());
         optout_codes.insert("secret-code".to_string());
+        let users = UsersCache::default();
+        users.insert("1".to_string(), "channelone".to_string());
         App {
             helix_client: HelixClient::default(),
             token: Arc::new(AppAccessToken::from_existing_unchecked(
@@ -646,7 +830,7 @@ mod tests {
                 None,
                 None,
             )),
-            users: UsersCache::default(),
+            users,
             optout_codes,
             db: Arc::new(clickhouse::Client::default().with_url("http://127.0.0.1:9")),
             config: Arc::new(config),
@@ -701,7 +885,7 @@ mod tests {
         );
         let (bot, mut writer_rx, server) = bot_with_server(router).await;
 
-        bot.fetch_recent_messages_for_channel("channelone")
+        bot.fetch_recent_messages_for_channel("channelone", "1")
             .await
             .unwrap();
 
@@ -715,6 +899,104 @@ mod tests {
         assert!(timeout(Duration::from_millis(50), writer_rx.recv())
             .await
             .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn normalizes_valid_items_and_rejects_untrusted_robotty_metadata() {
+        let valid = format!(
+            " \r\n\0{}\0\n ",
+            UUID_MESSAGE.replace("#channelone", "#ChAnNeLoNe")
+        );
+        let wrong_login = UUID_MESSAGE
+            .replace("#channelone", "#otherchannel")
+            .replace(
+                "272e342c-5864-4c59-b730-25908cdb7f57",
+                "372e342c-5864-4c59-b730-25908cdb7f57",
+            );
+        let wrong_room_id = UUID_MESSAGE.replace("room-id=1", "room-id=2").replace(
+            "272e342c-5864-4c59-b730-25908cdb7f57",
+            "472e342c-5864-4c59-b730-25908cdb7f57",
+        );
+        let missing_timestamp = UUID_MESSAGE
+            .replace("tmi-sent-ts=1704067200000;", "")
+            .replace(
+                "272e342c-5864-4c59-b730-25908cdb7f57",
+                "572e342c-5864-4c59-b730-25908cdb7f57",
+            );
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(move || {
+                let messages = vec![
+                    valid.clone(),
+                    wrong_login.clone(),
+                    wrong_room_id.clone(),
+                    missing_timestamp.clone(),
+                    "not raw irc".to_string(),
+                ];
+                async move {
+                    Json(serde_json::json!({
+                        "messages": messages,
+                        "error": null,
+                        "error_code": null
+                    }))
+                }
+            }),
+        );
+        let (bot, mut writer_rx, server) = bot_with_server(router).await;
+
+        bot.fetch_recent_messages_for_channel(" \0#CHANNELONE\r\n", "1")
+            .await
+            .unwrap();
+
+        let stored = timeout(Duration::from_secs(1), writer_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.channel_login, "channelone");
+        assert_eq!(stored.channel_id, "1");
+        assert_eq!(stored.timestamp, 1_704_067_200_000);
+        assert!(timeout(Duration::from_millis(50), writer_rx.recv())
+            .await
+            .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn robotty_items_are_stored_in_timestamp_order() {
+        let later = UUID_MESSAGE
+            .replace("1704067200000", "1704067202000")
+            .replace(
+                "272e342c-5864-4c59-b730-25908cdb7f57",
+                "672e342c-5864-4c59-b730-25908cdb7f57",
+            );
+        let earlier = UUID_MESSAGE
+            .replace("1704067200000", "1704067201000")
+            .replace(
+                "272e342c-5864-4c59-b730-25908cdb7f57",
+                "772e342c-5864-4c59-b730-25908cdb7f57",
+            );
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(move || {
+                let messages = vec![later.clone(), earlier.clone()];
+                async move {
+                    Json(serde_json::json!({
+                        "messages": messages,
+                        "error": null,
+                        "error_code": null
+                    }))
+                }
+            }),
+        );
+        let (bot, mut writer_rx, server) = bot_with_server(router).await;
+
+        bot.fetch_recent_messages_for_channel("channelone", "1")
+            .await
+            .unwrap();
+
+        assert_eq!(writer_rx.recv().await.unwrap().timestamp, 1_704_067_201_000);
+        assert_eq!(writer_rx.recv().await.unwrap().timestamp, 1_704_067_202_000);
         server.abort();
     }
 
@@ -737,7 +1019,9 @@ mod tests {
                 }
             }),
         );
-        let (bot, _writer_rx, server) = bot_with_server(router).await;
+        let (mut bot, _writer_rx, server) = bot_with_server(router).await;
+        bot.startup_backfill_delays = vec![Duration::ZERO; 5].into();
+        bot.reconnect_backfill_delays = vec![Duration::ZERO; 6].into();
         let own_join = ServerMessage::try_from(
             IRCMessage::parse(
                 ":justinfan12345!justinfan12345@justinfan12345.tmi.twitch.tv JOIN #channelone",
@@ -757,12 +1041,52 @@ mod tests {
         bot.trigger_backfill_for_own_join(&other_join, "justinfan12345")
             .await;
         wait_for_backfills(&bot).await;
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let after_coalesced_reconnect = requests.load(Ordering::SeqCst);
+        assert!((6..=7).contains(&after_coalesced_reconnect));
 
         bot.trigger_backfill_for_own_join(&own_join, "justinfan12345")
             .await;
         wait_for_backfills(&bot).await;
-        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            after_coalesced_reconnect + 6
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn first_join_runs_the_bounded_startup_catch_up_schedule() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let handler_requests = requests.clone();
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(move || {
+                let requests = handler_requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "messages": [],
+                        "error": null,
+                        "error_code": null
+                    }))
+                }
+            }),
+        );
+        let (mut bot, _writer_rx, server) = bot_with_server(router).await;
+        bot.startup_backfill_delays = vec![Duration::ZERO; 5].into();
+        let own_join = ServerMessage::try_from(
+            IRCMessage::parse(
+                ":justinfan12345!justinfan12345@justinfan12345.tmi.twitch.tv JOIN #channelone",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        bot.trigger_backfill_for_own_join(&own_join, "justinfan12345")
+            .await;
+        wait_for_backfills(&bot).await;
+
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
         server.abort();
     }
 
@@ -779,8 +1103,10 @@ mod tests {
             }),
         );
         let (bot, _writer_rx, server) = bot_with_server(router).await;
+        bot.app.users.insert("2".to_string(), "first".to_string());
+        bot.app.users.insert("3".to_string(), "second".to_string());
 
-        bot.trigger_recent_messages_fetch("first".to_string(), "test")
+        bot.trigger_recent_messages_fetch("first".to_string(), "test", BackfillSchedule::OneShot)
             .await;
         timeout(Duration::from_secs(1), async {
             loop {
@@ -799,7 +1125,7 @@ mod tests {
         .await
         .unwrap();
 
-        bot.trigger_recent_messages_fetch("second".to_string(), "test")
+        bot.trigger_recent_messages_fetch("second".to_string(), "test", BackfillSchedule::OneShot)
             .await;
         assert_eq!(bot.backfill_tasks.lock().await.len(), 1);
 
@@ -823,7 +1149,7 @@ mod tests {
         bot.skip_existing_message_lookup = false;
 
         assert!(bot
-            .fetch_recent_messages_for_channel("channelone")
+            .fetch_recent_messages_for_channel("channelone", "1")
             .await
             .is_err());
         assert!(writer_rx.try_recv().is_err());
@@ -833,26 +1159,32 @@ mod tests {
 
     #[tokio::test]
     async fn one_channel_failure_does_not_stop_another_backfill() {
+        let working_message = REPLAYED_COMMAND.replace("#channelone", "#working");
         let router = Router::new().route(
             "/api/v2/recent-messages/{channel}",
-            get(|Path(channel): Path<String>| async move {
-                if channel == "broken" {
-                    StatusCode::BAD_GATEWAY.into_response()
-                } else {
-                    Json(serde_json::json!({
-                        "messages": [REPLAYED_COMMAND],
-                        "error": null,
-                        "error_code": null
-                    }))
-                    .into_response()
+            get(move |Path(channel): Path<String>| {
+                let working_message = working_message.clone();
+                async move {
+                    if channel == "broken" {
+                        StatusCode::BAD_GATEWAY.into_response()
+                    } else {
+                        Json(serde_json::json!({
+                            "messages": [working_message],
+                            "error": null,
+                            "error_code": null
+                        }))
+                        .into_response()
+                    }
                 }
             }),
         );
         let (bot, mut writer_rx, server) = bot_with_server(router).await;
+        bot.app.users.insert("1".to_string(), "working".to_string());
+        bot.app.users.insert("2".to_string(), "broken".to_string());
 
-        bot.trigger_recent_messages_fetch("broken".to_string(), "test")
+        bot.trigger_recent_messages_fetch("broken".to_string(), "test", BackfillSchedule::OneShot)
             .await;
-        bot.trigger_recent_messages_fetch("working".to_string(), "test")
+        bot.trigger_recent_messages_fetch("working".to_string(), "test", BackfillSchedule::OneShot)
             .await;
         wait_for_backfills(&bot).await;
 
@@ -889,10 +1221,10 @@ mod tests {
         assert!(bot.claim_message(&prepared.dedupe_key));
         bot.write_prepared(prepared).await.unwrap();
 
-        bot.fetch_recent_messages_for_channel("channelone")
+        bot.fetch_recent_messages_for_channel("channelone", "1")
             .await
             .unwrap();
-        bot.fetch_recent_messages_for_channel("remoteerror")
+        bot.fetch_recent_messages_for_channel("remoteerror", "1")
             .await
             .unwrap();
 
@@ -936,5 +1268,14 @@ mod tests {
     #[test]
     fn backfill_inflight_ttl_exceeds_request_timeout() {
         assert!(Duration::from_secs(RECENT_MESSAGE_INFLIGHT_TTL_SECONDS) > RECENT_MESSAGES_TIMEOUT);
+    }
+
+    #[test]
+    fn normalizes_channel_logins_and_irc_framing() {
+        assert_eq!(normalize_channel_login(" \0#ChannelOne\r\n"), "channelone");
+        assert_eq!(
+            trim_irc_framing(" \r\n\0@room-id=1 PRIVMSG #channelone :hello\0\n "),
+            "@room-id=1 PRIVMSG #channelone :hello"
+        );
     }
 }

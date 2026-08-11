@@ -7,7 +7,7 @@ RUN yarn build
 FROM --platform=$BUILDPLATFORM rust:1.87-bookworm AS chef
 USER root
 ENV CARGO_PROFILE_RELEASE_LTO=true
-RUN cargo install cargo-chef
+RUN cargo install cargo-chef --version 0.1.71 --locked
 WORKDIR /app
 
 FROM --platform=$BUILDPLATFORM chef AS planner
@@ -28,6 +28,7 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 RUN rustup target add "$(cat /target.txt)"
 
 COPY --from=planner /app/recipe.json recipe.json
+COPY vendor/twitch-irc vendor/twitch-irc
 RUN RUSTFLAGS="$(cat /flags.txt)" cargo chef cook --target "$(cat /target.txt)" --release --recipe-path recipe.json
 COPY . .
 COPY --from=frontend /src/web web/
