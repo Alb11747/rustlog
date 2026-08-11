@@ -19,7 +19,7 @@ use std::{
 use tokio::{
     sync::{
         mpsc::{Receiver, Sender},
-        Mutex, Notify,
+        Mutex, Notify, OwnedSemaphorePermit, Semaphore,
     },
     task::JoinHandle,
     time::{sleep, sleep_until, Instant},
@@ -37,6 +37,8 @@ const RECENT_MESSAGE_DEDUPE_TTL_SECONDS: u64 = 30;
 const RECENT_MESSAGE_DEDUPE_CAPACITY: u64 = 50_000;
 const RECENT_MESSAGE_INFLIGHT_CAPACITY: u64 = 10_000;
 const RECENT_MESSAGE_INFLIGHT_TTL_SECONDS: u64 = 180;
+const RECENT_MESSAGE_MAX_CONCURRENT_REQUESTS: usize = 4;
+const RECENT_MESSAGE_REQUEST_SPACING_MILLIS: u64 = 250;
 const RECENT_MESSAGE_STARTUP_DELAYS_SECONDS: [u64; 5] = [0, 5, 15, 30, 60];
 const RECENT_MESSAGE_RECONNECT_DELAYS_SECONDS: [u64; 6] = [0, 5, 15, 30, 60, 120];
 
@@ -81,6 +83,9 @@ struct Bot {
     backfill_wakeups: Arc<DashMap<String, Arc<Notify>>>,
     backfill_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     seen_channel_joins: Arc<DashSet<String>>,
+    recent_message_request_slots: Arc<Semaphore>,
+    recent_message_next_request: Arc<Mutex<Instant>>,
+    recent_message_request_spacing: Duration,
     startup_backfill_delays: Arc<[Duration]>,
     reconnect_backfill_delays: Arc<[Duration]>,
     #[cfg(test)]
@@ -118,6 +123,13 @@ impl Bot {
             backfill_wakeups: Arc::new(DashMap::new()),
             backfill_tasks: Arc::new(Mutex::new(Vec::new())),
             seen_channel_joins: Arc::new(DashSet::new()),
+            recent_message_request_slots: Arc::new(Semaphore::new(
+                RECENT_MESSAGE_MAX_CONCURRENT_REQUESTS,
+            )),
+            recent_message_next_request: Arc::new(Mutex::new(Instant::now())),
+            recent_message_request_spacing: Duration::from_millis(
+                RECENT_MESSAGE_REQUEST_SPACING_MILLIS,
+            ),
             startup_backfill_delays: RECENT_MESSAGE_STARTUP_DELAYS_SECONDS
                 .map(Duration::from_secs)
                 .into(),
@@ -479,6 +491,7 @@ impl Bot {
         expected_channel_id: &str,
     ) -> anyhow::Result<()> {
         let channel_login = normalize_channel_login(channel_login);
+        let _request_permit = self.acquire_recent_message_request_permit().await?;
         let response = self.recent_messages.fetch(&channel_login).await?;
         if response.error.is_some() || response.error_code.is_some() {
             warn!(
@@ -560,6 +573,22 @@ impl Bot {
         );
 
         Ok(())
+    }
+
+    async fn acquire_recent_message_request_permit(&self) -> anyhow::Result<OwnedSemaphorePermit> {
+        let permit = self
+            .recent_message_request_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .context("Recent-message request gate was closed")?;
+        let mut next_request = self.recent_message_next_request.lock().await;
+        let now = Instant::now();
+        if *next_request > now {
+            sleep_until(*next_request).await;
+        }
+        *next_request = Instant::now() + self.recent_message_request_spacing;
+        Ok(permit)
     }
 
     async fn existing_message_keys(
@@ -791,9 +820,9 @@ mod tests {
     use std::{
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex as StdMutex,
         },
-        time::Duration,
+        time::{Duration, Instant as StdInstant},
     };
     use tokio::{net::TcpListener, sync::mpsc, time::timeout};
     use twitch_api::{
@@ -860,6 +889,7 @@ mod tests {
         let (writer_tx, writer_rx) = mpsc::channel(10);
         let mut bot =
             Bot::new_with_recent_messages(test_app(), writer_tx, recent_messages_client(address));
+        bot.recent_message_request_spacing = Duration::ZERO;
         bot.skip_existing_message_lookup = true;
         (bot, writer_rx, server)
     }
@@ -997,6 +1027,61 @@ mod tests {
 
         assert_eq!(writer_rx.recv().await.unwrap().timestamp, 1_704_067_201_000);
         assert_eq!(writer_rx.recv().await.unwrap().timestamp, 1_704_067_202_000);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn robotty_requests_are_spaced_and_concurrency_is_bounded() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(StdMutex::new(Vec::new()));
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get({
+                let requests = requests.clone();
+                let active = active.clone();
+                let max_active = max_active.clone();
+                let starts = starts.clone();
+                move || {
+                    let requests = requests.clone();
+                    let active = active.clone();
+                    let max_active = max_active.clone();
+                    let starts = starts.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(active_now, Ordering::SeqCst);
+                        starts.lock().unwrap().push(StdInstant::now());
+                        tokio::time::sleep(Duration::from_millis(75)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "messages": [],
+                            "error": null,
+                            "error_code": null
+                        }))
+                    }
+                }
+            }),
+        );
+        let (mut bot, _writer_rx, server) = bot_with_server(router).await;
+        bot.recent_message_request_spacing = Duration::from_millis(25);
+        bot.recent_message_request_slots = Arc::new(tokio::sync::Semaphore::new(2));
+
+        for index in 0..8 {
+            let channel_id = (index + 10).to_string();
+            let channel_login = format!("channel{index}");
+            bot.app.users.insert(channel_id, channel_login.clone());
+            bot.trigger_recent_messages_fetch(channel_login, "test", BackfillSchedule::OneShot)
+                .await;
+        }
+        wait_for_backfills(&bot).await;
+
+        let mut starts = starts.lock().unwrap().clone();
+        starts.sort_unstable();
+        assert_eq!(requests.load(Ordering::SeqCst), 8);
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert!(starts.last().unwrap().duration_since(starts[0]) >= Duration::from_millis(140));
         server.abort();
     }
 
