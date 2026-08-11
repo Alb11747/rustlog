@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context};
 use clickhouse::Client;
 use lazy_static::lazy_static;
 use prometheus::{register_int_gauge, IntGauge};
-use std::{collections::HashSet, ops::Range, sync::Arc, time::Duration};
+use std::{ops::Range, sync::Arc, time::Duration};
 use tokio::{
     sync::{
         mpsc::{channel, Sender},
@@ -14,7 +14,6 @@ use tokio::{
     time::{sleep, Instant},
 };
 use tracing::{debug, error, info, trace};
-use uuid::Uuid;
 
 const RETRY_COUNT: usize = 20;
 const RETRY_INTERVAL_SECONDS: u64 = 5;
@@ -33,16 +32,6 @@ pub struct FlushBuffer {
 }
 
 impl FlushBuffer {
-    pub async fn existing_message_ids(&self, candidate_ids: &HashSet<Uuid>) -> HashSet<Uuid> {
-        self.messages
-            .read()
-            .await
-            .iter()
-            .filter_map(StructuredMessage::uuid)
-            .filter(|id| candidate_ids.contains(id))
-            .collect()
-    }
-
     pub async fn messages_by_channel(
         &self,
         time_range: Range<u64>,

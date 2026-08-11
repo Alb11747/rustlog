@@ -6,12 +6,10 @@ use crate::{
     ShutdownRx,
 };
 use anyhow::{anyhow, Context};
-use chrono::{DateTime, TimeZone, Utc};
-use clickhouse::Row;
+use chrono::Utc;
 use lazy_static::lazy_static;
 use moka::sync::Cache;
 use prometheus::{register_int_counter_vec, IntCounterVec};
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -31,7 +29,6 @@ use twitch_irc::{
     message::{AsRawIRC, IRCMessage, ServerMessage},
     ClientConfig, SecureTCPTransport, TwitchIRCClient,
 };
-use uuid::Uuid;
 
 const CHANNEL_REJOIN_INTERVAL_SECONDS: u64 = 3600;
 const CHANNELS_REFETCH_RETRY_INTERVAL_SECONDS: u64 = 5;
@@ -78,28 +75,14 @@ struct Bot {
     recent_message_dedupe: Cache<String, ()>,
     backfill_inflight: Cache<String, ()>,
     backfill_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    #[cfg(test)]
+    skip_existing_message_lookup: bool,
 }
 
 struct PreparedMessage {
     message: StructuredMessage<'static>,
     dedupe_key: String,
 }
-
-#[derive(Row, Deserialize)]
-struct StoredMessageId {
-    #[serde(with = "clickhouse::serde::uuid")]
-    id: Uuid,
-}
-
-#[derive(Serialize)]
-#[serde(transparent)]
-struct ClickHouseDateTime64Millis(
-    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")] DateTime<Utc>,
-);
-
-#[derive(Serialize)]
-#[serde(transparent)]
-struct ClickHouseUuid(#[serde(with = "clickhouse::serde::uuid")] Uuid);
 
 impl Bot {
     pub fn new(app: App, writer_tx: Sender<StructuredMessage<'static>>) -> Bot {
@@ -124,6 +107,8 @@ impl Bot {
                 .max_capacity(RECENT_MESSAGE_INFLIGHT_CAPACITY)
                 .build(),
             backfill_tasks: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            skip_existing_message_lookup: false,
         }
     }
 
@@ -299,7 +284,7 @@ impl Bot {
                 raw: raw_irc,
             };
             let message = StructuredMessage::from_unstructured(&unstructured)?.into_owned();
-            let dedupe_key = event_identity(&irc_message, raw_irc, channel_id, timestamp);
+            let dedupe_key = structured_event_identity(&message);
             return Ok(Some(PreparedMessage {
                 message,
                 dedupe_key,
@@ -399,12 +384,9 @@ impl Bot {
             );
         }
 
-        let existing_ids = self.existing_message_ids(&candidates).await?;
+        let existing_keys = self.existing_message_keys(&candidates).await?;
         for prepared in candidates {
-            if prepared
-                .message
-                .uuid()
-                .is_some_and(|id| existing_ids.contains(&id))
+            if existing_keys.contains(&prepared.dedupe_key)
                 || !self.claim_message(&prepared.dedupe_key)
             {
                 continue;
@@ -417,69 +399,70 @@ impl Bot {
         Ok(())
     }
 
-    async fn existing_message_ids(
+    async fn existing_message_keys(
         &self,
         candidates: &[PreparedMessage],
-    ) -> anyhow::Result<HashSet<Uuid>> {
-        let candidate_ids = candidates
-            .iter()
-            .filter_map(|prepared| prepared.message.uuid())
-            .collect::<HashSet<_>>();
-        if candidate_ids.is_empty() {
+    ) -> anyhow::Result<HashSet<String>> {
+        #[cfg(test)]
+        if self.skip_existing_message_lookup {
             return Ok(HashSet::new());
         }
 
-        let mut existing_ids = self
-            .app
-            .flush_buffer
-            .existing_message_ids(&candidate_ids)
-            .await;
-        let mut groups = HashMap::<String, (u64, u64, Vec<Uuid>)>::new();
-        for prepared in candidates {
-            let Some(id) = prepared.message.uuid() else {
-                continue;
-            };
-            let entry = groups
-                .entry(prepared.message.channel_id.to_string())
-                .or_insert((
-                    prepared.message.timestamp,
-                    prepared.message.timestamp,
-                    Vec::new(),
-                ));
-            entry.0 = entry.0.min(prepared.message.timestamp);
-            entry.1 = entry.1.max(prepared.message.timestamp);
-            entry.2.push(id);
+        let candidate_keys = candidates
+            .iter()
+            .map(|prepared| prepared.dedupe_key.clone())
+            .collect::<HashSet<_>>();
+        if candidate_keys.is_empty() {
+            return Ok(HashSet::new());
         }
 
-        for (channel_id, (from, to, ids)) in groups {
-            let (from, to) = (
-                i64::try_from(from).context("recent-message timestamp is out of range")?,
-                i64::try_from(to).context("recent-message timestamp is out of range")?,
+        let mut existing_keys = HashSet::new();
+        let mut groups = HashMap::<String, (u64, u64)>::new();
+        for prepared in candidates {
+            let entry = groups
+                .entry(prepared.message.channel_id.to_string())
+                .or_insert((prepared.message.timestamp, prepared.message.timestamp));
+            entry.0 = entry.0.min(prepared.message.timestamp);
+            entry.1 = entry.1.max(prepared.message.timestamp);
+        }
+
+        for (channel_id, (from_millis, to_millis)) in groups {
+            let buffered = self
+                .app
+                .flush_buffer
+                .messages_by_channel(
+                    from_millis..to_millis.saturating_add(1),
+                    &channel_id,
+                )
+                .await;
+            existing_keys.extend(
+                buffered
+                    .iter()
+                    .map(structured_event_identity)
+                    .filter(|key| candidate_keys.contains(key)),
             );
-            let (from, to) = (
-                Utc.timestamp_millis_opt(from).single(),
-                Utc.timestamp_millis_opt(to).single(),
-            );
-            let from = from.context("recent-message start timestamp is invalid")?;
-            let to = to.context("recent-message end timestamp is invalid")?;
-            let ids = ids.into_iter().map(ClickHouseUuid).collect::<Vec<_>>();
-            let stored_ids = self
+
+            let stored_messages = self
                 .app
                 .db
                 .query(
-                    "SELECT id FROM message_structured WHERE channel_id = ? AND timestamp >= ? AND timestamp <= ? AND id IN ?",
+                    "SELECT ?fields FROM message_structured WHERE channel_id = ? AND timestamp >= ? AND timestamp <= ?",
                 )
                 .bind(channel_id)
-                .bind(ClickHouseDateTime64Millis(from))
-                .bind(ClickHouseDateTime64Millis(to))
-                .bind(ids)
-                .fetch_all::<StoredMessageId>()
+                .bind(from_millis as f64 / 1000.0)
+                .bind(to_millis as f64 / 1000.0)
+                .fetch_all::<StructuredMessage<'static>>()
                 .await
-                .context("could not check stored recent-message IDs")?;
-            existing_ids.extend(stored_ids.into_iter().map(|row| row.id));
+                .context("could not check stored recent-message identities")?;
+            existing_keys.extend(
+                stored_messages
+                    .iter()
+                    .map(structured_event_identity)
+                    .filter(|key| candidate_keys.contains(key)),
+            );
         }
 
-        Ok(existing_ids)
+        Ok(existing_keys)
     }
 
     async fn stop_backfill_tasks(&self) {
@@ -596,28 +579,20 @@ enum ChannelAction {
     Part,
 }
 
-fn event_identity(message: &IRCMessage, raw: &str, channel_id: &str, timestamp: u64) -> String {
-    if let Some(message_id) = message
-        .tags
-        .0
-        .get("id")
-        .and_then(|value| value.as_deref())
-        .filter(|value| !value.is_empty())
-    {
-        format!(
-            "{}:{channel_id}:{message_id}",
-            message.command.to_ascii_lowercase()
-        )
+fn structured_event_identity(message: &StructuredMessage<'_>) -> String {
+    if let Some(message_id) = message.uuid() {
+        format!("uuid:{message_id}")
     } else {
-        format!("raw:{timestamp}:{}", blake3::hash(raw.as_bytes()).to_hex())
+        let canonical = serde_json::to_vec(message)
+            .expect("serializing a structured message for deduplication cannot fail");
+        format!("row:{}", blake3::hash(&canonical).to_hex())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        event_identity, Bot, ClickHouseDateTime64Millis, ClickHouseUuid, ServerMessage,
-        RECENT_MESSAGE_INFLIGHT_TTL_SECONDS,
+        structured_event_identity, Bot, ServerMessage, RECENT_MESSAGE_INFLIGHT_TTL_SECONDS,
     };
     use crate::{
         app::{cache::UsersCache, App},
@@ -630,7 +605,6 @@ mod tests {
     use axum::{
         extract::Path, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
     };
-    use chrono::{TimeZone, Utc};
     use dashmap::DashSet;
     use std::{
         sync::{
@@ -645,7 +619,6 @@ mod tests {
         HelixClient,
     };
     use twitch_irc::message::IRCMessage;
-    use uuid::Uuid;
 
     const REPLAYED_COMMAND: &str = "@room-id=1;user-id=200;tmi-sent-ts=1704067200000;id=robotty-command;display-name=admin;badges=;color=;user-type=;emotes=;flags= :admin!admin@admin.tmi.twitch.tv PRIVMSG #channelone :!rustlog optout secret-code";
     const UUID_MESSAGE: &str = "@room-id=1;user-id=200;tmi-sent-ts=1704067200000;id=272e342c-5864-4c59-b730-25908cdb7f57;display-name=user;badges=;color=;user-type=;emotes=;flags= :user!user@user.tmi.twitch.tv PRIVMSG #channelone :hello";
@@ -701,8 +674,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await });
         let (writer_tx, writer_rx) = mpsc::channel(10);
-        let bot =
+        let mut bot =
             Bot::new_with_recent_messages(test_app(), writer_tx, recent_messages_client(address));
+        bot.skip_existing_message_lookup = true;
         (bot, writer_rx, server)
     }
 
@@ -845,7 +819,8 @@ mod tests {
                 }))
             }),
         );
-        let (bot, mut writer_rx, server) = bot_with_server(router).await;
+        let (mut bot, mut writer_rx, server) = bot_with_server(router).await;
+        bot.skip_existing_message_lookup = false;
 
         assert!(bot
             .fetch_recent_messages_for_channel("channelone")
@@ -929,40 +904,33 @@ mod tests {
     }
 
     #[test]
-    fn event_identity_uses_message_id_and_hash_fallback() {
-        let with_id = IRCMessage::parse(REPLAYED_COMMAND).unwrap();
+    fn event_identity_uses_uuid_and_structured_hash_fallback() {
+        let with_id = crate::db::schema::StructuredMessage::from_unstructured(
+            &crate::db::schema::UnstructuredMessage {
+                channel_id: "1",
+                user_id: "200",
+                timestamp: 1_704_067_200_000,
+                raw: UUID_MESSAGE,
+            },
+        )
+        .unwrap();
         assert_eq!(
-            event_identity(&with_id, REPLAYED_COMMAND, "1", 1_704_067_200_000),
-            "privmsg:1:robotty-command"
+            structured_event_identity(&with_id),
+            "uuid:272e342c-5864-4c59-b730-25908cdb7f57"
         );
 
-        let raw = ":user!user@user.tmi.twitch.tv PRIVMSG #channelone :hello";
-        let without_id = IRCMessage::parse(raw).unwrap();
-        assert_eq!(
-            event_identity(&without_id, raw, "1", 1_704_067_200_000),
-            format!(
-                "raw:1704067200000:{}",
-                blake3::hash(raw.as_bytes()).to_hex()
-            )
-        );
-    }
-
-    #[test]
-    fn recent_message_query_bindings_use_clickhouse_serializers() {
-        let timestamp = Utc
-            .timestamp_millis_opt(1_704_067_200_123)
-            .single()
-            .unwrap();
-        assert_eq!(
-            serde_json::to_value(ClickHouseDateTime64Millis(timestamp)).unwrap(),
-            serde_json::json!(1_704_067_200_123_i64)
-        );
-
-        let id = Uuid::parse_str("272e342c-5864-4c59-b730-25908cdb7f57").unwrap();
-        assert_eq!(
-            serde_json::to_value(vec![ClickHouseUuid(id)]).unwrap(),
-            serde_json::json!(["272e342c-5864-4c59-b730-25908cdb7f57"])
-        );
+        let without_id = crate::db::schema::StructuredMessage::from_unstructured(
+            &crate::db::schema::UnstructuredMessage {
+                channel_id: "1",
+                user_id: "200",
+                timestamp: 1_704_067_200_000,
+                raw: REPLAYED_COMMAND,
+            },
+        )
+        .unwrap();
+        let identity = structured_event_identity(&without_id);
+        assert!(identity.starts_with("row:"));
+        assert_eq!(identity, structured_event_identity(&without_id));
     }
 
     #[test]
