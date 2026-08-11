@@ -6,6 +6,7 @@ mod db;
 mod error;
 mod logs;
 mod migrator;
+mod recent_messages;
 mod web;
 
 pub type Result<T> = std::result::Result<T, error::Error>;

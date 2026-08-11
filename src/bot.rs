@@ -2,15 +2,27 @@ use crate::{
     app::App,
     db::schema::{StructuredMessage, UnstructuredMessage},
     logs::extract::{extract_channel_and_user_from_raw, extract_raw_timestamp},
+    recent_messages::RecentMessagesClient,
     ShutdownRx,
 };
 use anyhow::{anyhow, Context};
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
+use clickhouse::Row;
 use lazy_static::lazy_static;
+use moka::sync::Cache;
 use prometheus::{register_int_counter_vec, IntCounterVec};
-use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        mpsc::{Receiver, Sender},
+        Mutex,
+    },
+    task::JoinHandle,
     time::sleep,
 };
 use tracing::{debug, error, info, log::warn, trace};
@@ -19,9 +31,14 @@ use twitch_irc::{
     message::{AsRawIRC, IRCMessage, ServerMessage},
     ClientConfig, SecureTCPTransport, TwitchIRCClient,
 };
+use uuid::Uuid;
 
 const CHANNEL_REJOIN_INTERVAL_SECONDS: u64 = 3600;
-const CHANENLS_REFETCH_RETRY_INTERVAL_SECONDS: u64 = 5;
+const CHANNELS_REFETCH_RETRY_INTERVAL_SECONDS: u64 = 5;
+const RECENT_MESSAGE_DEDUPE_TTL_SECONDS: u64 = 30;
+const RECENT_MESSAGE_DEDUPE_CAPACITY: u64 = 50_000;
+const RECENT_MESSAGE_INFLIGHT_CAPACITY: u64 = 10_000;
+const RECENT_MESSAGE_INFLIGHT_TTL_SECONDS: u64 = 30;
 
 type TwitchClient<C> = TwitchIRCClient<SecureTCPTransport, C>;
 
@@ -57,11 +74,57 @@ pub async fn run<C: LoginCredentials>(
 struct Bot {
     app: App,
     writer_tx: Sender<StructuredMessage<'static>>,
+    recent_messages: RecentMessagesClient,
+    recent_message_dedupe: Cache<String, ()>,
+    backfill_inflight: Cache<String, ()>,
+    backfill_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
+
+struct PreparedMessage {
+    message: StructuredMessage<'static>,
+    dedupe_key: String,
+}
+
+#[derive(Row, Deserialize)]
+struct StoredMessageId {
+    #[serde(with = "clickhouse::serde::uuid")]
+    id: Uuid,
+}
+
+#[derive(Serialize)]
+#[serde(transparent)]
+struct ClickHouseDateTime64Millis(
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")] DateTime<Utc>,
+);
+
+#[derive(Serialize)]
+#[serde(transparent)]
+struct ClickHouseUuid(#[serde(with = "clickhouse::serde::uuid")] Uuid);
 
 impl Bot {
     pub fn new(app: App, writer_tx: Sender<StructuredMessage<'static>>) -> Bot {
-        Self { app, writer_tx }
+        Self::new_with_recent_messages(app, writer_tx, RecentMessagesClient::from_env())
+    }
+
+    fn new_with_recent_messages(
+        app: App,
+        writer_tx: Sender<StructuredMessage<'static>>,
+        recent_messages: RecentMessagesClient,
+    ) -> Bot {
+        Self {
+            app,
+            writer_tx,
+            recent_messages,
+            recent_message_dedupe: Cache::builder()
+                .time_to_live(Duration::from_secs(RECENT_MESSAGE_DEDUPE_TTL_SECONDS))
+                .max_capacity(RECENT_MESSAGE_DEDUPE_CAPACITY)
+                .build(),
+            backfill_inflight: Cache::builder()
+                .time_to_live(Duration::from_secs(RECENT_MESSAGE_INFLIGHT_TTL_SECONDS))
+                .max_capacity(RECENT_MESSAGE_INFLIGHT_CAPACITY)
+                .build(),
+            backfill_tasks: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     pub async fn run<C: LoginCredentials>(
@@ -70,6 +133,13 @@ impl Bot {
         mut shutdown_rx: ShutdownRx,
         mut command_rx: Receiver<BotMessage>,
     ) {
+        let own_login = match login_credentials.get_credentials().await {
+            Ok(credentials) => Some(credentials.login),
+            Err(err) => {
+                warn!("Could not determine IRC login for recent-message backfill: {err}");
+                None
+            }
+        };
         let client_config = ClientConfig::new_simple(login_credentials);
         let (mut receiver, client) = TwitchIRCClient::<SecureTCPTransport, C>::new(client_config);
 
@@ -95,7 +165,7 @@ impl Bot {
                     }
                     Err(err) => {
                         error!("Could not fetch users list: {err}");
-                        CHANENLS_REFETCH_RETRY_INTERVAL_SECONDS
+                        CHANNELS_REFETCH_RETRY_INTERVAL_SECONDS
                     }
                 };
                 sleep(Duration::from_secs(interval)).await;
@@ -138,12 +208,13 @@ impl Bot {
         loop {
             tokio::select! {
                 Some(msg) = receiver.recv() => {
-                    if let Err(e) = self.handle_message(msg, &client).await {
+                    if let Err(e) = self.handle_message(msg, &client, own_login.as_deref()).await {
                         error!("Could not handle message: {e}");
                     }
                 }
                 _ = shutdown_rx.changed() => {
                     debug!("Shutting down bot task");
+                    self.stop_backfill_tasks().await;
                     break;
                 }
             }
@@ -154,7 +225,21 @@ impl Bot {
         &self,
         msg: ServerMessage,
         client: &TwitchClient<C>,
+        own_login: Option<&str>,
     ) -> anyhow::Result<()> {
+        if let Some(own_login) = own_login {
+            self.trigger_backfill_for_own_join(&msg, own_login).await;
+        }
+
+        let raw_irc = msg.as_raw_irc();
+        let prepared = self.prepare_message(IRCMessage::from(msg.clone()), &raw_irc)?;
+        let Some(prepared) = prepared else {
+            return Ok(());
+        };
+        if !self.claim_message(&prepared.dedupe_key) {
+            return Ok(());
+        }
+
         if let ServerMessage::Privmsg(privmsg) = &msg {
             trace!("Processing message {}", privmsg.message_text);
             if let Some(cmd) = privmsg.message_text.strip_prefix(COMMAND_PREFIX) {
@@ -167,9 +252,18 @@ impl Bot {
             }
         }
 
-        self.write_message(msg).await?;
+        self.write_prepared(prepared).await?;
 
         Ok(())
+    }
+
+    async fn trigger_backfill_for_own_join(&self, msg: &ServerMessage, own_login: &str) {
+        if let ServerMessage::Join(join) = msg {
+            if join.user_login.eq_ignore_ascii_case(own_login) {
+                self.trigger_recent_messages_fetch(join.channel_login.clone(), "successful join")
+                    .await;
+            }
+        }
     }
 
     fn check_admin(&self, user_login: &str) -> anyhow::Result<()> {
@@ -186,47 +280,216 @@ impl Bot {
         }
     }
 
-    async fn write_message(&self, msg: ServerMessage) -> anyhow::Result<()> {
-        // Ignore
-        if matches!(msg, ServerMessage::RoomState(_)) {
-            return Ok(());
+    fn prepare_message(
+        &self,
+        irc_message: IRCMessage,
+        raw_irc: &str,
+    ) -> anyhow::Result<Option<PreparedMessage>> {
+        if irc_message.command == "ROOMSTATE" {
+            return Ok(None);
         }
-
-        let irc_message = IRCMessage::from(msg);
-
         if let Some((channel_id, maybe_user_id)) = extract_channel_and_user_from_raw(&irc_message) {
-            if !channel_id.is_empty() {
-                MESSAGES_RECEIVED_COUNTERS
-                    .with_label_values(&[channel_id])
-                    .inc();
-            }
-
             let timestamp = extract_raw_timestamp(&irc_message)
                 .unwrap_or_else(|| Utc::now().timestamp_millis().try_into().unwrap());
             let user_id = maybe_user_id.unwrap_or_default().to_owned();
-
-            if self.app.config.opt_out.contains_key(&user_id) {
-                return Ok(());
-            }
-
-            let raw_irc = irc_message.as_raw_irc();
             let unstructured = UnstructuredMessage {
                 channel_id,
                 user_id: &user_id,
                 timestamp,
-                raw: &raw_irc,
+                raw: raw_irc,
             };
-            match StructuredMessage::from_unstructured(&unstructured) {
-                Ok(msg) => {
-                    self.writer_tx.send(msg.into_owned()).await?;
+            let message = StructuredMessage::from_unstructured(&unstructured)?.into_owned();
+            let dedupe_key = event_identity(&irc_message, raw_irc, channel_id, timestamp);
+            return Ok(Some(PreparedMessage {
+                message,
+                dedupe_key,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn claim_message(&self, dedupe_key: &str) -> bool {
+        self.recent_message_dedupe
+            .entry(dedupe_key.to_owned())
+            .or_insert_with(|| ())
+            .is_fresh()
+    }
+
+    async fn write_prepared(&self, prepared: PreparedMessage) -> anyhow::Result<()> {
+        let message = prepared.message;
+        if self
+            .app
+            .config
+            .opt_out
+            .contains_key(message.channel_id.as_ref())
+            || self
+                .app
+                .config
+                .opt_out
+                .contains_key(message.user_id.as_ref())
+        {
+            return Ok(());
+        }
+
+        if !message.channel_id.is_empty() {
+            MESSAGES_RECEIVED_COUNTERS
+                .with_label_values(&[message.channel_id.as_ref()])
+                .inc();
+        }
+        self.writer_tx.send(message).await?;
+        Ok(())
+    }
+
+    async fn trigger_recent_messages_fetch(&self, channel_login: String, reason: &'static str) {
+        if !self.recent_messages.enabled() {
+            return;
+        }
+
+        let channel_login = channel_login.to_ascii_lowercase();
+        if !self
+            .backfill_inflight
+            .entry(channel_login.clone())
+            .or_insert_with(|| ())
+            .is_fresh()
+        {
+            return;
+        }
+
+        let bot = self.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(err) = bot.fetch_recent_messages_for_channel(&channel_login).await {
+                warn!("Recent-message backfill failed for {channel_login} after {reason}: {err:#}");
+            }
+            bot.backfill_inflight.invalidate(&channel_login);
+        });
+        let mut tasks = self.backfill_tasks.lock().await;
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
+    }
+
+    async fn fetch_recent_messages_for_channel(&self, channel_login: &str) -> anyhow::Result<()> {
+        let response = self.recent_messages.fetch(channel_login).await?;
+        if response.error.is_some() || response.error_code.is_some() {
+            warn!(
+                "Recent-message backfill skipped for {channel_login}: error={:?} error_code={:?}",
+                response.error, response.error_code
+            );
+            return Ok(());
+        }
+
+        let mut candidates = Vec::new();
+        let mut response_keys = HashSet::new();
+        let mut parse_failures = 0_usize;
+        for raw in response.messages {
+            let parsed = IRCMessage::parse(raw.trim().trim_matches('\0'))
+                .map_err(anyhow::Error::from)
+                .and_then(|message| self.prepare_message(message, &raw));
+            match parsed {
+                Ok(Some(prepared)) if response_keys.insert(prepared.dedupe_key.clone()) => {
+                    candidates.push(prepared);
                 }
-                Err(err) => {
-                    error!("Could not convert message {unstructured:?} to be logged: {err}");
-                }
+                Ok(_) => {}
+                Err(_) => parse_failures += 1,
+            }
+        }
+        if parse_failures > 0 {
+            warn!(
+                "Recent-message backfill for {channel_login} skipped {parse_failures} malformed raw IRC line(s)"
+            );
+        }
+
+        let existing_ids = self.existing_message_ids(&candidates).await?;
+        for prepared in candidates {
+            if prepared
+                .message
+                .uuid()
+                .is_some_and(|id| existing_ids.contains(&id))
+                || !self.claim_message(&prepared.dedupe_key)
+            {
+                continue;
+            }
+            if let Err(err) = self.write_prepared(prepared).await {
+                warn!("Could not store recent-message backfill event for {channel_login}: {err}");
             }
         }
 
         Ok(())
+    }
+
+    async fn existing_message_ids(
+        &self,
+        candidates: &[PreparedMessage],
+    ) -> anyhow::Result<HashSet<Uuid>> {
+        let candidate_ids = candidates
+            .iter()
+            .filter_map(|prepared| prepared.message.uuid())
+            .collect::<HashSet<_>>();
+        if candidate_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut existing_ids = self
+            .app
+            .flush_buffer
+            .existing_message_ids(&candidate_ids)
+            .await;
+        let mut groups = HashMap::<String, (u64, u64, Vec<Uuid>)>::new();
+        for prepared in candidates {
+            let Some(id) = prepared.message.uuid() else {
+                continue;
+            };
+            let entry = groups
+                .entry(prepared.message.channel_id.to_string())
+                .or_insert((
+                    prepared.message.timestamp,
+                    prepared.message.timestamp,
+                    Vec::new(),
+                ));
+            entry.0 = entry.0.min(prepared.message.timestamp);
+            entry.1 = entry.1.max(prepared.message.timestamp);
+            entry.2.push(id);
+        }
+
+        for (channel_id, (from, to, ids)) in groups {
+            let (from, to) = (
+                i64::try_from(from).context("recent-message timestamp is out of range")?,
+                i64::try_from(to).context("recent-message timestamp is out of range")?,
+            );
+            let (from, to) = (
+                Utc.timestamp_millis_opt(from).single(),
+                Utc.timestamp_millis_opt(to).single(),
+            );
+            let from = from.context("recent-message start timestamp is invalid")?;
+            let to = to.context("recent-message end timestamp is invalid")?;
+            let ids = ids.into_iter().map(ClickHouseUuid).collect::<Vec<_>>();
+            let stored_ids = self
+                .app
+                .db
+                .query(
+                    "SELECT id FROM message_structured WHERE channel_id = ? AND timestamp >= ? AND timestamp <= ? AND id IN ?",
+                )
+                .bind(channel_id)
+                .bind(ClickHouseDateTime64Millis(from))
+                .bind(ClickHouseDateTime64Millis(to))
+                .bind(ids)
+                .fetch_all::<StoredMessageId>()
+                .await
+                .context("could not check stored recent-message IDs")?;
+            existing_ids.extend(stored_ids.into_iter().map(|row| row.id));
+        }
+
+        Ok(existing_ids)
+    }
+
+    async fn stop_backfill_tasks(&self) {
+        let tasks = std::mem::take(&mut *self.backfill_tasks.lock().await);
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
     }
 
     async fn handle_command<C: LoginCredentials>(
@@ -331,4 +594,379 @@ impl Bot {
 enum ChannelAction {
     Join,
     Part,
+}
+
+fn event_identity(message: &IRCMessage, raw: &str, channel_id: &str, timestamp: u64) -> String {
+    if let Some(message_id) = message
+        .tags
+        .0
+        .get("id")
+        .and_then(|value| value.as_deref())
+        .filter(|value| !value.is_empty())
+    {
+        format!(
+            "{}:{channel_id}:{message_id}",
+            message.command.to_ascii_lowercase()
+        )
+    } else {
+        format!("raw:{timestamp}:{}", blake3::hash(raw.as_bytes()).to_hex())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        event_identity, Bot, ClickHouseDateTime64Millis, ClickHouseUuid, ServerMessage,
+        RECENT_MESSAGE_INFLIGHT_TTL_SECONDS,
+    };
+    use crate::{
+        app::{cache::UsersCache, App},
+        config::Config,
+        db::writer::FlushBuffer,
+        recent_messages::{
+            RecentMessagesClient, RecentMessagesRuntimeSummary, RECENT_MESSAGES_TIMEOUT,
+        },
+    };
+    use axum::{
+        extract::Path, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
+    };
+    use chrono::{TimeZone, Utc};
+    use dashmap::DashSet;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+    use twitch_api::{
+        twitch_oauth2::{AccessToken, AppAccessToken, ClientId, ClientSecret},
+        HelixClient,
+    };
+    use twitch_irc::message::IRCMessage;
+    use uuid::Uuid;
+
+    const REPLAYED_COMMAND: &str = "@room-id=1;user-id=200;tmi-sent-ts=1704067200000;id=robotty-command;display-name=admin;badges=;color=;user-type=;emotes=;flags= :admin!admin@admin.tmi.twitch.tv PRIVMSG #channelone :!rustlog optout secret-code";
+    const UUID_MESSAGE: &str = "@room-id=1;user-id=200;tmi-sent-ts=1704067200000;id=272e342c-5864-4c59-b730-25908cdb7f57;display-name=user;badges=;color=;user-type=;emotes=;flags= :user!user@user.tmi.twitch.tv PRIVMSG #channelone :hello";
+
+    fn test_app() -> App {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "clickhouseUrl": "http://127.0.0.1:9",
+            "clickhouseDb": "rustlog",
+            "channels": ["1"],
+            "clientID": "client",
+            "clientSecret": "secret",
+            "admins": ["admin"],
+            "optOut": {}
+        }))
+        .unwrap();
+        let optout_codes = Arc::new(DashSet::new());
+        optout_codes.insert("secret-code".to_string());
+        App {
+            helix_client: HelixClient::default(),
+            token: Arc::new(AppAccessToken::from_existing_unchecked(
+                AccessToken::new("token".to_string()),
+                None,
+                ClientId::new("client".to_string()),
+                ClientSecret::new("secret".to_string()),
+                None,
+                None,
+            )),
+            users: UsersCache::default(),
+            optout_codes,
+            db: Arc::new(clickhouse::Client::default().with_url("http://127.0.0.1:9")),
+            config: Arc::new(config),
+            flush_buffer: FlushBuffer::default(),
+        }
+    }
+
+    fn recent_messages_client(address: std::net::SocketAddr) -> RecentMessagesClient {
+        RecentMessagesClient::from_summary(RecentMessagesRuntimeSummary {
+            enabled: true,
+            base_url: Some(format!("http://{address}/api/v2/recent-messages")),
+            limit: 800,
+            warnings: Vec::new(),
+        })
+    }
+
+    async fn bot_with_server(
+        router: Router,
+    ) -> (
+        Bot,
+        mpsc::Receiver<crate::db::schema::StructuredMessage<'static>>,
+        tokio::task::JoinHandle<Result<(), std::io::Error>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let (writer_tx, writer_rx) = mpsc::channel(10);
+        let bot =
+            Bot::new_with_recent_messages(test_app(), writer_tx, recent_messages_client(address));
+        (bot, writer_rx, server)
+    }
+
+    async fn wait_for_backfills(bot: &Bot) {
+        let tasks = std::mem::take(&mut *bot.backfill_tasks.lock().await);
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_stores_command_once_without_command_side_effects() {
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(|| async {
+                Json(serde_json::json!({
+                    "messages": ["not raw irc", REPLAYED_COMMAND, REPLAYED_COMMAND],
+                    "error": null,
+                    "error_code": null
+                }))
+            }),
+        );
+        let (bot, mut writer_rx, server) = bot_with_server(router).await;
+
+        bot.fetch_recent_messages_for_channel("channelone")
+            .await
+            .unwrap();
+
+        let stored = timeout(Duration::from_secs(1), writer_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.user_friendly_text(), "!rustlog optout secret-code");
+        assert!(bot.app.optout_codes.contains("secret-code"));
+        assert!(!bot.app.config.opt_out.contains_key("200"));
+        assert!(timeout(Duration::from_millis(50), writer_rx.recv())
+            .await
+            .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_own_joins_trigger_backfill_and_suppress_concurrent_fetches() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let handler_requests = requests.clone();
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(move || {
+                let requests = handler_requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Json(serde_json::json!({
+                        "messages": [],
+                        "error": null,
+                        "error_code": null
+                    }))
+                }
+            }),
+        );
+        let (bot, _writer_rx, server) = bot_with_server(router).await;
+        let own_join = ServerMessage::try_from(
+            IRCMessage::parse(
+                ":justinfan12345!justinfan12345@justinfan12345.tmi.twitch.tv JOIN #channelone",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let other_join = ServerMessage::try_from(
+            IRCMessage::parse(":viewer!viewer@viewer.tmi.twitch.tv JOIN #channelone").unwrap(),
+        )
+        .unwrap();
+
+        bot.trigger_backfill_for_own_join(&own_join, "justinfan12345")
+            .await;
+        bot.trigger_backfill_for_own_join(&own_join, "justinfan12345")
+            .await;
+        bot.trigger_backfill_for_own_join(&other_join, "justinfan12345")
+            .await;
+        wait_for_backfills(&bot).await;
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        bot.trigger_backfill_for_own_join(&own_join, "justinfan12345")
+            .await;
+        wait_for_backfills(&bot).await;
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn triggering_a_backfill_prunes_finished_task_handles() {
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(|| async {
+                Json(serde_json::json!({
+                    "messages": [],
+                    "error": null,
+                    "error_code": null
+                }))
+            }),
+        );
+        let (bot, _writer_rx, server) = bot_with_server(router).await;
+
+        bot.trigger_recent_messages_fetch("first".to_string(), "test")
+            .await;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if bot
+                    .backfill_tasks
+                    .lock()
+                    .await
+                    .first()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        bot.trigger_recent_messages_fetch("second".to_string(), "test")
+            .await;
+        assert_eq!(bot.backfill_tasks.lock().await.len(), 1);
+
+        wait_for_backfills(&bot).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stored_id_lookup_failure_prevents_backfill_insert() {
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(|| async {
+                Json(serde_json::json!({
+                    "messages": [UUID_MESSAGE],
+                    "error": null,
+                    "error_code": null
+                }))
+            }),
+        );
+        let (bot, mut writer_rx, server) = bot_with_server(router).await;
+
+        assert!(bot
+            .fetch_recent_messages_for_channel("channelone")
+            .await
+            .is_err());
+        assert!(writer_rx.try_recv().is_err());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn one_channel_failure_does_not_stop_another_backfill() {
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(|Path(channel): Path<String>| async move {
+                if channel == "broken" {
+                    StatusCode::BAD_GATEWAY.into_response()
+                } else {
+                    Json(serde_json::json!({
+                        "messages": [REPLAYED_COMMAND],
+                        "error": null,
+                        "error_code": null
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let (bot, mut writer_rx, server) = bot_with_server(router).await;
+
+        bot.trigger_recent_messages_fetch("broken".to_string(), "test")
+            .await;
+        bot.trigger_recent_messages_fetch("working".to_string(), "test")
+            .await;
+        wait_for_backfills(&bot).await;
+
+        assert!(writer_rx.recv().await.is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn replay_dedupes_against_a_live_message_and_skips_remote_errors() {
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(|Path(channel): Path<String>| async move {
+                if channel == "remoteerror" {
+                    Json(serde_json::json!({
+                        "messages": [REPLAYED_COMMAND],
+                        "error": "temporarily unavailable",
+                        "error_code": "503"
+                    }))
+                } else {
+                    Json(serde_json::json!({
+                        "messages": [REPLAYED_COMMAND],
+                        "error": null,
+                        "error_code": null
+                    }))
+                }
+            }),
+        );
+        let (bot, mut writer_rx, server) = bot_with_server(router).await;
+        let message = IRCMessage::parse(REPLAYED_COMMAND).unwrap();
+        let prepared = bot
+            .prepare_message(message, REPLAYED_COMMAND)
+            .unwrap()
+            .unwrap();
+        assert!(bot.claim_message(&prepared.dedupe_key));
+        bot.write_prepared(prepared).await.unwrap();
+
+        bot.fetch_recent_messages_for_channel("channelone")
+            .await
+            .unwrap();
+        bot.fetch_recent_messages_for_channel("remoteerror")
+            .await
+            .unwrap();
+
+        assert!(writer_rx.recv().await.is_some());
+        assert!(timeout(Duration::from_millis(50), writer_rx.recv())
+            .await
+            .is_err());
+        server.abort();
+    }
+
+    #[test]
+    fn event_identity_uses_message_id_and_hash_fallback() {
+        let with_id = IRCMessage::parse(REPLAYED_COMMAND).unwrap();
+        assert_eq!(
+            event_identity(&with_id, REPLAYED_COMMAND, "1", 1_704_067_200_000),
+            "privmsg:1:robotty-command"
+        );
+
+        let raw = ":user!user@user.tmi.twitch.tv PRIVMSG #channelone :hello";
+        let without_id = IRCMessage::parse(raw).unwrap();
+        assert_eq!(
+            event_identity(&without_id, raw, "1", 1_704_067_200_000),
+            format!(
+                "raw:1704067200000:{}",
+                blake3::hash(raw.as_bytes()).to_hex()
+            )
+        );
+    }
+
+    #[test]
+    fn recent_message_query_bindings_use_clickhouse_serializers() {
+        let timestamp = Utc
+            .timestamp_millis_opt(1_704_067_200_123)
+            .single()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(ClickHouseDateTime64Millis(timestamp)).unwrap(),
+            serde_json::json!(1_704_067_200_123_i64)
+        );
+
+        let id = Uuid::parse_str("272e342c-5864-4c59-b730-25908cdb7f57").unwrap();
+        assert_eq!(
+            serde_json::to_value(vec![ClickHouseUuid(id)]).unwrap(),
+            serde_json::json!(["272e342c-5864-4c59-b730-25908cdb7f57"])
+        );
+    }
+
+    #[test]
+    fn backfill_inflight_ttl_exceeds_request_timeout() {
+        assert!(Duration::from_secs(RECENT_MESSAGE_INFLIGHT_TTL_SECONDS) > RECENT_MESSAGES_TIMEOUT);
+    }
 }

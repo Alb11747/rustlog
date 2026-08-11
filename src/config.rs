@@ -33,7 +33,8 @@ impl Config {
     pub fn load(config_path: &std::path::Path) -> anyhow::Result<Self> {
         let contents = fs::read_to_string(config_path)
             .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
-        let mut s: Self = serde_json::from_str(&contents).context("Config deserializtion error")?;
+        let mut s: Self =
+            serde_json::from_str(&contents).context("Config deserialization error")?;
         s.config_path = Some(config_path.to_owned());
         Ok(s)
     }
@@ -41,7 +42,12 @@ impl Config {
     pub fn save(&self) -> anyhow::Result<()> {
         info!("Updating config");
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(self.config_path.as_ref().expect("config path should always be available"), json)?;
+        fs::write(
+            self.config_path
+                .as_ref()
+                .expect("config path should always be available"),
+            json,
+        )?;
 
         Ok(())
     }
