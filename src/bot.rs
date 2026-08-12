@@ -341,20 +341,6 @@ impl Bot {
 
     async fn write_prepared(&self, prepared: PreparedMessage) -> anyhow::Result<()> {
         let message = prepared.message;
-        if self
-            .app
-            .config
-            .opt_out
-            .contains_key(message.channel_id.as_ref())
-            || self
-                .app
-                .config
-                .opt_out
-                .contains_key(message.user_id.as_ref())
-        {
-            return Ok(());
-        }
-
         if !message.channel_id.is_empty() {
             MESSAGES_RECEIVED_COUNTERS
                 .with_label_values(&[message.channel_id.as_ref()])

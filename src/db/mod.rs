@@ -261,6 +261,7 @@ pub async fn read_random_channel_line(
     Ok(msg)
 }
 
+#[allow(dead_code)]
 pub async fn delete_user_logs(_db: &Client, _user_id: &str) -> Result<()> {
     // info!("Deleting all logs for user {user_id}");
     // db.query("ALTER TABLE message DELETE WHERE user_id = ?")
