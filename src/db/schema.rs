@@ -46,7 +46,7 @@ impl MessageFlags {
         Some(value)
     }
 
-    pub fn as_tags(&self) -> impl Iterator<Item = (Tag, &'static str)> {
+    pub fn as_tags(&self) -> impl Iterator<Item = (Tag<'_>, &'static str)> {
         [
             Tag::Subscriber,
             Tag::Vip,
@@ -290,7 +290,7 @@ impl<'a> StructuredMessage<'a> {
         }
     }
 
-    pub fn all_tags(&self, escape: bool) -> Vec<(Tag, Cow<'_, str>)> {
+    pub fn all_tags(&self, escape: bool) -> Vec<(Tag<'_>, Cow<'_, str>)> {
         let mut tags = Vec::with_capacity(16);
 
         tags.push((Tag::TmiSentTs, Cow::Owned(self.timestamp.to_string())));
