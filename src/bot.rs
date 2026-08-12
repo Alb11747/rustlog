@@ -385,16 +385,7 @@ impl Bot {
         {
             return false;
         }
-        !self
-            .app
-            .config
-            .opt_out
-            .contains_key(message.channel_id.as_ref())
-            && !self
-                .app
-                .config
-                .opt_out
-                .contains_key(message.user_id.as_ref())
+        true
     }
 
     async fn trigger_recent_messages_fetch(

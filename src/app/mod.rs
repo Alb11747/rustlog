@@ -1,16 +1,10 @@
 pub mod cache;
 
 use self::cache::UsersCache;
-use crate::{
-    config::Config,
-    db::{delete_user_logs, writer::FlushBuffer},
-    error::Error,
-    Result,
-};
-use anyhow::Context;
+use crate::{config::Config, db::writer::FlushBuffer, error::Error, Result};
 use dashmap::DashSet;
 use std::{collections::HashMap, sync::Arc};
-use tracing::{debug, info};
+use tracing::debug;
 use twitch_api::{helix::users::GetUsersRequest, twitch_oauth2::AppAccessToken, HelixClient};
 
 #[derive(Clone)]
@@ -125,29 +119,11 @@ impl App {
         }
     }
 
-    pub async fn optout_user(&self, user_id: &str) -> anyhow::Result<()> {
-        delete_user_logs(&self.db, user_id)
-            .await
-            .context("Could not delete logs")?;
-
-        self.config.opt_out.insert(user_id.to_owned(), true);
-        self.config.save()?;
-        info!("User {user_id} opted out");
-
+    pub async fn optout_user(&self, _user_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
 
-    pub fn check_opted_out(&self, channel_id: &str, user_id: Option<&str>) -> Result<()> {
-        if self.config.opt_out.contains_key(channel_id) {
-            return Err(Error::ChannelOptedOut);
-        }
-
-        if let Some(user_id) = user_id {
-            if self.config.opt_out.contains_key(user_id) {
-                return Err(Error::UserOptedOut);
-            }
-        }
-
+    pub fn check_opted_out(&self, _channel_id: &str, _user_id: Option<&str>) -> Result<()> {
         Ok(())
     }
 }
