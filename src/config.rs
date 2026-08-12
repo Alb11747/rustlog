@@ -43,7 +43,8 @@ impl Config {
     pub fn load(config_path: &std::path::Path) -> anyhow::Result<Self> {
         let contents = fs::read_to_string(config_path)
             .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
-        let mut s: Self = serde_json::from_str(&contents).context("Config deserializtion error")?;
+        let mut s: Self =
+            serde_json::from_str(&contents).context("Config deserialization error")?;
         s.config_path = Some(config_path.to_owned());
         Ok(s)
     }

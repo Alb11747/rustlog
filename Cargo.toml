@@ -16,6 +16,7 @@ blake3 = "1.8.2"
 chrono = { version = "0.4.27", features = ["serde"] }
 clap = { version = "4.4.1", features = ["derive"] }
 clickhouse = { version = "0.13.0", default-features = false, features = [
+    "chrono",
     "lz4",
     "uuid",
     "inserter",
@@ -28,7 +29,7 @@ indexmap = "2.2.6"
 lazy_static = "1.4.0"
 mimalloc = { version = "0.1.38", default-features = false }
 mime_guess = "2.0.4"
-prometheus = "0.13.3"
+prometheus = "0.14"
 rand = "0.9.0"
 rayon = "1.7.0"
 reqwest = { version = "0.12.4", features = [
@@ -52,7 +53,7 @@ tower-http = { version = "0.6.1", features = [
 ] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
-twitch-irc = { version = "5.0.1", default-features = false, features = [
+twitch-irc = { git = "https://github.com/Alb11747/twitch-irc-rs.git", rev = "280ecebec2b6425e3377f35b18f2e47f8aa464b4", version = "6.1.1", default-features = false, features = [
     "metrics-collection",
     "transport-tcp-rustls-webpki-roots",
 ] }
@@ -62,9 +63,9 @@ twitch_api = { version = "0.7.0", features = [
     "reqwest",
     "twitch_oauth2",
 ] }
-tmi = { version = "0.7.0", default-features = false, features = ["simd"] }
+tmi = { git = "https://github.com/Alb11747/tmi-rs.git", rev = "ca501e32cd482833fe4c50100c4030ea91598fd0", version = "0.10.0", default-features = false, features = ["simd"] }
 axum-prometheus = "0.8.0"
-metrics-prometheus = "0.8.0"
+metrics-prometheus = "0.11.2"
 moka = { version = "0.12.14", features = ["sync"] }
 axum-extra = { version = "0.10.0", features = ["typed-header"] }
 bitflags = { version = "2.5.0", features = ["serde"] }

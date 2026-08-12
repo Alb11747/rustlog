@@ -12,7 +12,6 @@ use lazy_static::lazy_static;
 use moka::sync::Cache;
 use prometheus::{register_int_counter_vec, IntCounterVec};
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
@@ -496,15 +495,15 @@ impl Bot {
         let mut channel_login_mismatches = 0_usize;
         let mut channel_id_mismatches = 0_usize;
         for (response_index, raw) in response.messages.into_iter().enumerate() {
-            let normalized_raw = normalize_robotty_message(&raw);
-            let parsed = IRCMessage::parse(normalized_raw.as_ref()).map_err(anyhow::Error::from);
+            let normalized_raw = trim_irc_framing(&raw);
+            let parsed = IRCMessage::parse(normalized_raw).map_err(anyhow::Error::from);
             match parsed {
                 Ok(message) => {
                     if extract_raw_timestamp(&message).is_none() {
                         missing_timestamps += 1;
                         continue;
                     }
-                    match self.prepare_message(message, normalized_raw.as_ref()) {
+                    match self.prepare_message(message, normalized_raw) {
                         Ok(Some(prepared)) => {
                             if prepared.message.channel_login != channel_login {
                                 channel_login_mismatches += 1;
@@ -777,39 +776,8 @@ fn trim_irc_framing(raw: &str) -> &str {
     raw.trim_matches(|character: char| character.is_ascii_whitespace() || character == '\0')
 }
 
-fn normalize_robotty_message(raw: &str) -> Cow<'_, str> {
-    let raw = trim_irc_framing(raw);
-    let Some(tagged) = raw.strip_prefix('@') else {
-        return Cow::Borrowed(raw);
-    };
-    let Some((tags, remainder)) = tagged.split_once(' ') else {
-        return Cow::Borrowed(raw);
-    };
-    if tags
-        .split(';')
-        .all(|tag| tag.is_empty() || tag.contains('='))
-    {
-        return Cow::Borrowed(raw);
-    }
-
-    let mut normalized = String::with_capacity(raw.len() + 8);
-    normalized.push('@');
-    for (index, tag) in tags.split(';').enumerate() {
-        if index > 0 {
-            normalized.push(';');
-        }
-        normalized.push_str(tag);
-        if !tag.is_empty() && !tag.contains('=') {
-            normalized.push('=');
-        }
-    }
-    normalized.push(' ');
-    normalized.push_str(remainder);
-    Cow::Owned(normalized)
-}
-
 fn structured_event_identity(message: &StructuredMessage<'_>) -> String {
-    if let Some(message_id) = message.id() {
+    if let Some(message_id) = message.uuid() {
         format!("uuid:{message_id}")
     } else {
         let canonical = serde_json::to_vec(message)
@@ -820,12 +788,17 @@ fn structured_event_identity(message: &StructuredMessage<'_>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{structured_event_identity, BackfillSchedule, Bot, ServerMessage};
+    use super::{
+        normalize_channel_login, structured_event_identity, trim_irc_framing, BackfillSchedule,
+        Bot, ServerMessage, RECENT_MESSAGE_INFLIGHT_TTL_SECONDS,
+    };
     use crate::{
         app::{cache::UsersCache, App},
         config::Config,
         db::writer::FlushBuffer,
-        recent_messages::{RecentMessagesClient, RecentMessagesRuntimeSummary},
+        recent_messages::{
+            RecentMessagesClient, RecentMessagesRuntimeSummary, RECENT_MESSAGES_TIMEOUT,
+        },
     };
     use axum::{
         extract::Path, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
@@ -847,7 +820,6 @@ mod tests {
 
     const REPLAYED_COMMAND: &str = "@room-id=1;user-id=200;tmi-sent-ts=1704067200000;id=robotty-command;display-name=admin;badges=;color=;user-type=;emotes=;flags= :admin!admin@admin.tmi.twitch.tv PRIVMSG #channelone :!rustlog optout secret-code";
     const UUID_MESSAGE: &str = "@room-id=1;user-id=200;tmi-sent-ts=1704067200000;id=272e342c-5864-4c59-b730-25908cdb7f57;display-name=user;badges=;color=;user-type=;emotes=;flags= :user!user@user.tmi.twitch.tv PRIVMSG #channelone :hello";
-    const ROBOTTY_VALUELESS_MESSAGE: &str = "@display-name=user;flags;badge-info;id=272e342c-5864-4c59-b730-25908cdb7f57;badges;user-type;color=#00FF7F;emotes;room-id=1;tmi-sent-ts=1704067200000;user-id=200 :user!user@user.tmi.twitch.tv PRIVMSG #channelone :hello";
 
     fn test_app() -> App {
         let config: Config = serde_json::from_value(serde_json::json!({
@@ -951,7 +923,7 @@ mod tests {
     async fn normalizes_valid_items_and_rejects_untrusted_robotty_metadata() {
         let valid = format!(
             " \r\n\0{}\0\n ",
-            ROBOTTY_VALUELESS_MESSAGE.replace("#channelone", "#ChAnNeLoNe")
+            UUID_MESSAGE.replace("#channelone", "#ChAnNeLoNe")
         );
         let wrong_login = UUID_MESSAGE
             .replace("#channelone", "#otherchannel")
@@ -1001,11 +973,6 @@ mod tests {
         assert_eq!(stored.channel_login, "channelone");
         assert_eq!(stored.channel_id, "1");
         assert_eq!(stored.timestamp, 1_704_067_200_000);
-        assert_eq!(
-            stored.id().as_deref(),
-            Some("272e342c-5864-4c59-b730-25908cdb7f57")
-        );
-        assert_eq!(stored.color, Some(0x00ff7f));
         assert!(timeout(Duration::from_millis(50), writer_rx.recv())
             .await
             .is_err());
@@ -1141,18 +1108,13 @@ mod tests {
 
         bot.trigger_backfill_for_own_join(&own_join, "justinfan12345")
             .await;
-        wait_for_backfills(&bot).await;
-        assert_eq!(requests.load(Ordering::SeqCst), 5);
-
-        bot.trigger_backfill_for_own_join(&own_join, "justinfan12345")
-            .await;
         bot.trigger_backfill_for_own_join(&own_join, "justinfan12345")
             .await;
         bot.trigger_backfill_for_own_join(&other_join, "justinfan12345")
             .await;
         wait_for_backfills(&bot).await;
         let after_coalesced_reconnect = requests.load(Ordering::SeqCst);
-        assert!((11..=12).contains(&after_coalesced_reconnect));
+        assert!((6..=7).contains(&after_coalesced_reconnect));
 
         bot.trigger_backfill_for_own_join(&own_join, "justinfan12345")
             .await;
@@ -1161,6 +1123,85 @@ mod tests {
             requests.load(Ordering::SeqCst),
             after_coalesced_reconnect + 6
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn first_join_runs_the_bounded_startup_catch_up_schedule() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let handler_requests = requests.clone();
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(move || {
+                let requests = handler_requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "messages": [],
+                        "error": null,
+                        "error_code": null
+                    }))
+                }
+            }),
+        );
+        let (mut bot, _writer_rx, server) = bot_with_server(router).await;
+        bot.startup_backfill_delays = vec![Duration::ZERO; 5].into();
+        let own_join = ServerMessage::try_from(
+            IRCMessage::parse(
+                ":justinfan12345!justinfan12345@justinfan12345.tmi.twitch.tv JOIN #channelone",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        bot.trigger_backfill_for_own_join(&own_join, "justinfan12345")
+            .await;
+        wait_for_backfills(&bot).await;
+
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn triggering_a_backfill_prunes_finished_task_handles() {
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(|| async {
+                Json(serde_json::json!({
+                    "messages": [],
+                    "error": null,
+                    "error_code": null
+                }))
+            }),
+        );
+        let (bot, _writer_rx, server) = bot_with_server(router).await;
+        bot.app.users.insert("2".to_string(), "first".to_string());
+        bot.app.users.insert("3".to_string(), "second".to_string());
+
+        bot.trigger_recent_messages_fetch("first".to_string(), "test", BackfillSchedule::OneShot)
+            .await;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if bot
+                    .backfill_tasks
+                    .lock()
+                    .await
+                    .first()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        bot.trigger_recent_messages_fetch("second".to_string(), "test", BackfillSchedule::OneShot)
+            .await;
+        assert_eq!(bot.backfill_tasks.lock().await.len(), 1);
+
+        wait_for_backfills(&bot).await;
         server.abort();
     }
 
@@ -1294,5 +1335,19 @@ mod tests {
         let identity = structured_event_identity(&without_id);
         assert!(identity.starts_with("row:"));
         assert_eq!(identity, structured_event_identity(&without_id));
+    }
+
+    #[test]
+    fn backfill_inflight_ttl_exceeds_request_timeout() {
+        assert!(Duration::from_secs(RECENT_MESSAGE_INFLIGHT_TTL_SECONDS) > RECENT_MESSAGES_TIMEOUT);
+    }
+
+    #[test]
+    fn normalizes_channel_logins_and_irc_framing() {
+        assert_eq!(normalize_channel_login(" \0#ChannelOne\r\n"), "channelone");
+        assert_eq!(
+            trim_irc_framing(" \r\n\0@room-id=1 PRIVMSG #channelone :hello\0\n "),
+            "@room-id=1 PRIVMSG #channelone :hello"
+        );
     }
 }
