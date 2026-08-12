@@ -7,7 +7,7 @@ Available options:
 - `clickhouseDb` (string): Clickhouse database name.
 - `clickhouseUsername` (string): Clickhouse username.
 - `clickhousePassword` (string): Clickhouse password.
-- `clickhouseFlushInterval` (number): Interval (in seconds) of how often messages should be flushed to the database. A lower value means that logs are available sooner at the expensive of higher database load. Defaults to 10.
+- `clickhouseFlushInterval` (number): Interval (in seconds) of how often messages should be flushed to the database. A lower value means that logs are available sooner at the expense of higher database load. Defaults to 10.
 - `listenAddress` (string): Listening address for the web server. Defaults to `0.0.0.0:8025`.
 - `recentMessagesEnabled` (boolean): Enables best-effort Robotty recent-message recovery. Defaults to `false`.
 - `recentMessagesUrl` (string): Robotty-compatible recent-messages base URL. Defaults to `https://recent-messages.robotty.de/api/v2/recent-messages`. Only HTTP and HTTPS URLs are accepted.

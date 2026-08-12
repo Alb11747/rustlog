@@ -282,6 +282,10 @@ impl<'a> StructuredMessage<'a> {
         }
     }
 
+    pub(crate) fn uuid(&self) -> Option<Uuid> {
+        (!self.id.is_nil()).then_some(self.id)
+    }
+
     pub fn display_name(&self) -> &str {
         if !self.display_name.is_empty() {
             &self.display_name
