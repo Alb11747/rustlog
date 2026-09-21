@@ -21,6 +21,8 @@ Available options:
 
 When enabled, rustlog requests recent messages after it successfully joins a channel at startup, after reconnecting, and after a runtime channel addition. Backfill is best-effort: request, response, and individual IRC parsing failures are logged without stopping live Twitch ingest.
 
+Replayed messages never execute chat commands. A live command still executes if recovery has already stored its message. Removing a channel stops further recovery requests and prevents pending responses from being queued for storage.
+
 Example config:
 ```json
 {
