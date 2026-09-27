@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM node:18-alpine as frontend
+FROM --platform=$BUILDPLATFORM node:18-alpine AS frontend
 WORKDIR /src/web
 COPY web .
 RUN yarn install --ignore-optional
@@ -7,7 +7,7 @@ RUN yarn build
 FROM --platform=$BUILDPLATFORM rust:1.98-trixie AS chef
 USER root
 ENV CARGO_PROFILE_RELEASE_LTO=true
-RUN cargo install cargo-chef
+RUN cargo install cargo-chef --version 0.1.71 --locked
 WORKDIR /app
 
 FROM --platform=$BUILDPLATFORM chef AS planner
