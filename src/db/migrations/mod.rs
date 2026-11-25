@@ -6,7 +6,7 @@ use crate::Result;
 use clickhouse::Client;
 use structured::StructuredMigration;
 use tracing::{debug, info};
-use username_history::UsernameHistoryMigration;
+use username_history::{UsernameHistoryLoginIndexMigration, UsernameHistoryMigration};
 
 use self::migratable::Migratable;
 
@@ -74,6 +74,13 @@ String CODEC(ZSTD(10))
     run_migration(db, "6_structured_message", StructuredMigration { db_name }).await?;
 
     run_migration(db, "7_username_history", UsernameHistoryMigration).await?;
+
+    run_migration(
+        db,
+        "8_username_history_login_index",
+        UsernameHistoryLoginIndexMigration,
+    )
+    .await?;
 
     Ok(())
 }

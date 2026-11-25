@@ -1,7 +1,7 @@
 pub mod cache;
 
 use self::cache::UsersCache;
-use crate::{config::Config, db::writer::FlushBuffer, error::Error, Result};
+use crate::{config::Config, db, db::writer::FlushBuffer, error::Error, Result};
 use dashmap::DashSet;
 use std::{collections::HashMap, sync::Arc};
 use tracing::debug;
@@ -110,10 +110,18 @@ impl App {
                         self.users.insert(user_id.clone(), user.login.to_string());
                         Ok(user_id)
                     }
-                    None => {
-                        self.users.insert_optional(None, Some(name.to_owned()));
-                        Err(Error::NotFound)
-                    }
+                    // Suspended or deactivated users are not returned by
+                    // Helix, but their id may still be known from logs
+                    None => match db::get_user_id_by_login_history(&self.db, name).await? {
+                        Some(user_id) => {
+                            self.users.insert(user_id.clone(), name.to_owned());
+                            Ok(user_id)
+                        }
+                        None => {
+                            self.users.insert_optional(None, Some(name.to_owned()));
+                            Err(Error::NotFound)
+                        }
+                    },
                 }
             }
         }

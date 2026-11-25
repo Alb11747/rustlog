@@ -416,6 +416,29 @@ pub async fn get_user_name_history(db: &Client, user_id: &str) -> Result<Vec<Pre
     Ok(names)
 }
 
+/// Finds the most recent user id that used `login`, for accounts Helix no
+/// longer returns (suspended or deactivated). Older rows may store the login
+/// with a leading ':', so both forms are matched.
+pub async fn get_user_id_by_login_history(db: &Client, login: &str) -> Result<Option<String>> {
+    let login = login.to_lowercase();
+    let query = "
+        SELECT user_id
+        FROM username_history
+        WHERE user_login IN (?, ?) AND user_id != ''
+        GROUP BY user_id
+        ORDER BY max(last_timestamp) DESC
+        LIMIT 1";
+
+    let user_id = db
+        .query(query)
+        .bind(&login)
+        .bind(format!(":{login}"))
+        .fetch_optional::<String>()
+        .await?;
+
+    Ok(user_id)
+}
+
 fn apply_limit_offset(query: &mut String, buffer_response: &FlushBufferResponse) {
     if let Some(limit) = buffer_response.normalized_limit() {
         *query = format!("{query} LIMIT {limit}");

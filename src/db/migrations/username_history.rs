@@ -79,3 +79,28 @@ impl<'a> Migratable<'a> for UsernameHistoryMigration {
         Ok(())
     }
 }
+
+/// Lets suspended/deactivated users, which Helix no longer returns, be resolved
+/// from login to id via `username_history`. The table is ordered by `user_id`,
+/// so lookups by login would otherwise scan every granule.
+pub struct UsernameHistoryLoginIndexMigration;
+
+impl<'a> Migratable<'a> for UsernameHistoryLoginIndexMigration {
+    async fn run(&self, db: &'a clickhouse::Client) -> anyhow::Result<()> {
+        db.query(
+            "ALTER TABLE username_history
+            ADD INDEX IF NOT EXISTS user_login_bf user_login TYPE bloom_filter GRANULARITY 1",
+        )
+        .execute()
+        .await
+        .context("Could not add username_history login index")?;
+
+        // Runs as a background mutation; queries work before it completes.
+        db.query("ALTER TABLE username_history MATERIALIZE INDEX user_login_bf")
+            .execute()
+            .await
+            .context("Could not materialize username_history login index")?;
+
+        Ok(())
+    }
+}
