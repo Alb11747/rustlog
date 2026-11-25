@@ -581,12 +581,20 @@ impl Bot {
             let normalized_raw = trim_irc_framing(&raw);
             let parsed = IRCMessage::parse(normalized_raw).map_err(anyhow::Error::from);
             match parsed {
-                Ok(message) => {
+                Ok(mut message) => {
                     if extract_raw_timestamp(&message).is_none() {
                         missing_timestamps += 1;
                         continue;
                     }
-                    match self.prepare_message(message, normalized_raw) {
+                    // Robotty annotates replayed lines with its own metadata. Storing it would
+                    // make replayed rows differ from live ones, which defeats deduplication of
+                    // events without a message UUID (e.g. CLEARCHAT).
+                    message
+                        .tags
+                        .0
+                        .retain(|key, _| !is_recent_messages_metadata_tag(key));
+                    let replay_raw = message.as_raw_irc();
+                    match self.prepare_message(message, &replay_raw) {
                         Ok(Some(prepared)) => {
                             if prepared.message.channel_login != channel_login {
                                 channel_login_mismatches += 1;
@@ -867,6 +875,11 @@ fn normalize_channel_login(channel_login: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Tags added by the recent-messages service rather than by Twitch.
+fn is_recent_messages_metadata_tag(key: &str) -> bool {
+    key == "historical" || key.starts_with("rm-")
+}
+
 fn trim_irc_framing(raw: &str) -> &str {
     raw.trim_matches(|character: char| character.is_ascii_whitespace() || character == '\0')
 }
@@ -977,6 +990,15 @@ mod tests {
         (bot, writer_rx, server)
     }
 
+    /// Each client registers metrics, so tests must not share the global registry.
+    fn test_irc_client() -> super::TwitchClient<twitch_irc::login::StaticLoginCredentials> {
+        let mut config = twitch_irc::ClientConfig::new_simple(
+            twitch_irc::login::StaticLoginCredentials::anonymous(),
+        );
+        config.metrics_config = twitch_irc::MetricsConfig::Disabled;
+        super::TwitchClient::new(config).1
+    }
+
     async fn wait_for_backfills(bot: &Bot) {
         let tasks = std::mem::take(&mut *bot.backfill_tasks.lock().await);
         for task in tasks {
@@ -1026,9 +1048,7 @@ mod tests {
             .await
             .unwrap();
         assert!(bot.app.optout_codes.contains("secret-code"));
-        let (_, client) = super::TwitchClient::new(twitch_irc::ClientConfig::new_simple(
-            twitch_irc::login::StaticLoginCredentials::anonymous(),
-        ));
+        let client = test_irc_client();
         let live = ServerMessage::try_from(IRCMessage::parse(REPLAYED_COMMAND).unwrap()).unwrap();
         bot.handle_message(live.clone(), &client, None)
             .await
@@ -1641,6 +1661,38 @@ mod tests {
         assert!(timeout(Duration::from_millis(50), writer_rx.recv())
             .await
             .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn replay_strips_robotty_tags_and_dedupes_events_without_uuid() {
+        const LIVE_CLEARCHAT: &str = "@room-id=1;target-user-id=200;tmi-sent-ts=1704067200000;ban-duration=600 :tmi.twitch.tv CLEARCHAT #channelone :user";
+        const REPLAYED_CLEARCHAT: &str = "@historical=1;rm-received-ts=1704067200123;room-id=1;target-user-id=200;tmi-sent-ts=1704067200000;ban-duration=600 :tmi.twitch.tv CLEARCHAT #channelone :user";
+        const REPLAYED_OTHER: &str = "@historical=1;rm-received-ts=1704067300123;room-id=1;target-user-id=201;tmi-sent-ts=1704067300000;ban-duration=600 :tmi.twitch.tv CLEARCHAT #channelone :other";
+        let router = Router::new().route(
+            "/api/v2/recent-messages/{channel}",
+            get(|| async {
+                Json(serde_json::json!({"messages": [REPLAYED_CLEARCHAT, REPLAYED_OTHER]}))
+            }),
+        );
+        let (bot, mut writer_rx, server) = bot_with_server(router).await;
+        let client = test_irc_client();
+        let live = ServerMessage::try_from(IRCMessage::parse(LIVE_CLEARCHAT).unwrap()).unwrap();
+        bot.handle_message(live, &client, None).await.unwrap();
+
+        bot.fetch_recent_messages_for_channel("channelone", "1")
+            .await
+            .unwrap();
+
+        let live = writer_rx.try_recv().unwrap();
+        let replayed = writer_rx.try_recv().unwrap();
+        assert!(writer_rx.try_recv().is_err());
+        assert_eq!(live.user_login, "user");
+        assert_eq!(replayed.user_login, "other");
+        assert!(replayed
+            .extra_tags
+            .iter()
+            .all(|(key, _)| key.as_ref() != "historical" && !key.starts_with("rm-")));
         server.abort();
     }
 
